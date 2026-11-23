@@ -1,0 +1,242 @@
+
+/*
+  6 TCRT5000 Analog Sensors
+  Arduino UNO + TB6612FNG
+
+  BLACK LINE / WHITE BACKGROUND
+
+  S1 = Leftmost Sensor
+  S6 = Rightmost Sensor
+
+  Motor A = Left
+  Motor B = Right
+*/
+
+// Sensor Pins
+const int sensorPins[6] = {
+  A0, A1, A2, A3, A4, A5
+};
+
+// Calibrated Thresholds
+int threshold[6] = {
+  319, 152, 125,
+  204, 227, 293
+};
+
+// Sensor Values
+int sensorValues[6];
+bool isBlack[6];
+
+// Sensor Positions
+int weights[6] = {
+  -2500, -1500, -500,
+   500, 1500, 2500
+};
+
+// TB6612FNG Motor Pins
+const int PWMA = 5;
+const int PWMB = 6;
+
+const int AIN1 = 7;
+const int AIN2 = 8;
+
+const int STBY = 9;
+
+const int BIN1 = 10;
+const int BIN2 = 11;
+
+// Motor Speed
+int baseSpeed = 100;
+int maxSpeed = 180;
+
+// PID Values
+float Kp = 0.04;
+float Ki = 0.0;
+float Kd = 0.12;
+
+float error = 0;
+float previousError = 0;
+float integral = 0;
+
+// Serial Monitor Timer
+unsigned long lastPrint = 0;
+
+// SETUP
+void setup() {
+
+  Serial.begin(9600);
+
+  // Motor Pins
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+
+  pinMode(STBY, OUTPUT);
+
+  digitalWrite(STBY, HIGH);
+
+  stopMotors();
+
+  Serial.println("6 SENSOR PID LINE FOLLOWER");
+  Serial.println("BLACK LINE / WHITE BG");
+
+  delay(2000);
+}
+
+// READ ALL SENSORS
+void readAllSensors() {
+
+  for (int i = 0; i < 6; i++) {
+
+    // Discard first ADC reading
+    analogRead(sensorPins[i]);
+
+    long total = 0;
+
+    for (int j = 0; j < 4; j++) {
+      total += analogRead(sensorPins[i]);
+    }
+
+    sensorValues[i] = total / 4;
+
+    if (sensorValues[i] > threshold[i]) {
+      isBlack[i] = true;
+    } else {
+      isBlack[i] = false;
+    }
+  }
+}
+
+// MOTOR CONTROL
+void setMotors(int leftSpeed, int rightSpeed) {
+
+  leftSpeed = constrain(leftSpeed, 0, 255);
+  rightSpeed = constrain(rightSpeed, 0, 255);
+
+  // Left Motor Forward
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+
+  // Right Motor Forward
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
+
+  analogWrite(PWMA, leftSpeed);
+  analogWrite(PWMB, rightSpeed);
+}
+
+// STOP MOTORS
+void stopMotors() {
+
+  analogWrite(PWMA, 0);
+  analogWrite(PWMB, 0);
+}
+
+// PRINT SENSOR VALUES
+void printSensors() {
+
+  Serial.print("VALUES: ");
+
+  for (int i = 0; i < 6; i++) {
+
+    Serial.print("S");
+    Serial.print(i + 1);
+    Serial.print("=");
+    Serial.print(sensorValues[i]);
+    Serial.print(" ");
+  }
+
+  Serial.println();
+
+  Serial.print("COLOR : ");
+
+  for (int i = 0; i < 6; i++) {
+
+    Serial.print(isBlack[i] ? "B " : "W ");
+  }
+
+  Serial.println();
+
+  Serial.print("ERROR: ");
+  Serial.println(error);
+
+  Serial.println("------------------------");
+}
+
+// MAIN LOOP
+void loop() {
+
+  readAllSensors();
+
+  long weightedSum = 0;
+  int activeSensors = 0;
+
+  // Find Black Line Position
+  for (int i = 0; i < 6; i++) {
+
+    if (isBlack[i]) {
+
+      weightedSum += weights[i];
+      activeSensors++;
+    }
+  }
+
+  // BLACK LINE DETECTED
+  if (activeSensors > 0) {
+
+    error = (float)weightedSum / activeSensors;
+
+    // PID Calculation
+    integral += error;
+
+    integral = constrain(
+      integral, -10000, 10000
+    );
+
+    float derivative =
+      error - previousError;
+
+    float correction =
+      Kp * error +
+      Ki * integral +
+      Kd * derivative;
+
+    previousError = error;
+
+    // Motor Speed Calculation
+    int leftSpeed = constrain(
+      baseSpeed + correction,
+      0, maxSpeed
+    );
+
+    int rightSpeed = constrain(
+      baseSpeed - correction,
+      0, maxSpeed
+    );
+
+    setMotors(leftSpeed, rightSpeed);
+
+  }
+
+  // BLACK LINE LOST
+  else {
+
+    stopMotors();
+
+    integral = 0;
+    previousError = 0;
+    error = 0;
+  }
+
+  // Serial Monitor Output
+  if (millis() - lastPrint >= 300) {
+
+    lastPrint = millis();
+    printSensors();
+  }
+}
