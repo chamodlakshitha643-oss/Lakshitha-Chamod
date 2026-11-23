@@ -1,0 +1,344 @@
+
+/*
+  8 SENSOR HYBRID PID LINE FOLLOWER
+
+  Arduino UNO + TB6612FNG
+  6 TCRT5000 Analog Sensors
+  2 HW-201 Digital Sensors
+
+  BLACK LINE / WHITE BACKGROUND
+
+  S1 = LEFT, S6 = RIGHT
+  Motor A = LEFT, Motor B = RIGHT
+  Digital BLACK = 1, WHITE = 0
+*/
+
+// ===== SENSOR PINS =====
+const byte sensorPins[6] = {
+  A0, A1, A2, A3, A4, A5
+};
+
+const byte LEFT_IR = 2;
+const byte RIGHT_IR = 3;
+
+// ===== CALIBRATION =====
+const int whiteValue[6] = {
+  26, 28, 27, 30, 32, 30
+};
+
+const int blackValue[6] = {
+  612, 275, 222, 377, 421, 555
+};
+
+const int threshold[6] = {
+  319, 152, 125, 204, 227, 293
+};
+
+// ===== SENSOR VARIABLES =====
+int rawValue[6];
+int normalized[6];
+bool analogBlack[6];
+
+bool leftBlack = false;
+bool rightBlack = false;
+
+// ===== MOTOR PINS =====
+const byte PWMA = 5;
+const byte PWMB = 6;
+
+const byte AIN1 = 7;
+const byte AIN2 = 8;
+
+const byte STBY = 9;
+
+const byte BIN1 = 10;
+const byte BIN2 = 11;
+
+// ===== SPEED SETTINGS =====
+int baseSpeed = 90;
+int maxSpeed = 170;
+int minSpeed = 55;
+
+int turnSpeed = 85;
+
+// ===== PID SETTINGS =====
+float Kp = 0.045;
+float Ki = 0.0;
+float Kd = 0.10;
+
+float error = 0;
+float lastError = 0;
+float integral = 0;
+
+unsigned long lastPrint = 0;
+
+// ===== MOTOR CONTROL =====
+void setMotors(int left, int right) {
+
+  left = constrain(left, -255, 255);
+  right = constrain(right, -255, 255);
+
+  // LEFT MOTOR
+  if (left >= 0) {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+  } else {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+  }
+
+  // RIGHT MOTOR
+  if (right >= 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+  } else {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+  }
+
+  analogWrite(PWMA, abs(left));
+  analogWrite(PWMB, abs(right));
+}
+
+void stopMotors() {
+  analogWrite(PWMA, 0);
+  analogWrite(PWMB, 0);
+}
+
+// ===== SENSOR READING =====
+void readSensors() {
+
+  for (int i = 0; i < 6; i++) {
+
+    // ADC settling
+    analogRead(sensorPins[i]);
+
+    long sum = 0;
+
+    for (int j = 0; j < 4; j++) {
+      sum += analogRead(sensorPins[i]);
+    }
+
+    rawValue[i] = sum / 4;
+
+    // Calibrated threshold detection
+    analogBlack[i] =
+      (rawValue[i] > threshold[i]);
+
+    // Normalize analog readings
+    normalized[i] = map(
+      rawValue[i],
+      whiteValue[i],
+      blackValue[i],
+      0, 1000
+    );
+
+    normalized[i] =
+      constrain(normalized[i], 0, 1000);
+  }
+
+  // HW-201 digital sensors
+  leftBlack = (digitalRead(LEFT_IR) == HIGH);
+  rightBlack = (digitalRead(RIGHT_IR) == HIGH);
+}
+
+// ===== PID LINE FOLLOWING =====
+void followLine() {
+
+  long weightedSum = 0;
+  long totalStrength = 0;
+
+  int blackCount = 0;
+
+  for (int i = 0; i < 6; i++) {
+
+    if (analogBlack[i]) {
+      blackCount++;
+    }
+
+    int strength = normalized[i];
+
+    // Reject weak signals
+    if (strength < 100) {
+      strength = 0;
+    }
+
+    weightedSum +=
+      (long)strength * (i * 1000);
+
+    totalStrength += strength;
+  }
+
+  // ===== LEFT SHARP TURN =====
+  if (leftBlack &&
+      !rightBlack &&
+      blackCount <= 1) {
+
+    setMotors(-turnSpeed, turnSpeed);
+
+    error = -2500;
+    lastError = error;
+    integral = 0;
+
+    return;
+  }
+
+  // ===== RIGHT SHARP TURN =====
+  if (rightBlack &&
+      !leftBlack &&
+      blackCount <= 1) {
+
+    setMotors(turnSpeed, -turnSpeed);
+
+    error = 2500;
+    lastError = error;
+    integral = 0;
+
+    return;
+  }
+
+  // ===== NORMAL PID =====
+  if (totalStrength > 150) {
+
+    float position =
+      (float)weightedSum / totalStrength;
+
+    // Center of sensor array = 2500
+    error = position - 2500;
+
+    integral += error;
+
+    integral = constrain(
+      integral, -10000, 10000
+    );
+
+    float derivative = error - lastError;
+
+    float correction =
+      Kp * error +
+      Ki * integral +
+      Kd * derivative;
+
+    lastError = error;
+
+    // Dynamic speed
+    int currentSpeed =
+      baseSpeed - (int)(abs(error) * 0.012);
+
+    currentSpeed = constrain(
+      currentSpeed,
+      minSpeed,
+      baseSpeed
+    );
+
+    int leftSpeed = constrain(
+      (int)(currentSpeed + correction),
+      0, maxSpeed
+    );
+
+    int rightSpeed = constrain(
+      (int)(currentSpeed - correction),
+      0, maxSpeed
+    );
+
+    setMotors(leftSpeed, rightSpeed);
+
+  } else {
+
+    // Line lost
+    stopMotors();
+
+    integral = 0;
+    lastError = 0;
+    error = 0;
+  }
+}
+
+// ===== SERIAL MONITOR =====
+void printSensors() {
+
+  Serial.println("========== SENSOR DATA ==========");
+
+  Serial.println("ANALOG:");
+
+  for (int i = 0; i < 6; i++) {
+
+    Serial.print("S");
+    Serial.print(i + 1);
+
+    Serial.print(" RAW=");
+    Serial.print(rawValue[i]);
+
+    Serial.print(" TH=");
+    Serial.print(threshold[i]);
+
+    Serial.print(" NORM=");
+    Serial.print(normalized[i]);
+
+    Serial.print(" ");
+
+    Serial.println(
+      analogBlack[i] ? "BLACK" : "WHITE"
+    );
+  }
+
+  Serial.println("DIGITAL:");
+
+  Serial.print("LEFT  = ");
+  Serial.print(leftBlack ? 1 : 0);
+  Serial.print(" ");
+  Serial.println(leftBlack ? "BLACK" : "WHITE");
+
+  Serial.print("RIGHT = ");
+  Serial.print(rightBlack ? 1 : 0);
+  Serial.print(" ");
+  Serial.println(rightBlack ? "BLACK" : "WHITE");
+
+  Serial.print("PID ERROR = ");
+  Serial.println(error);
+
+  Serial.println("===============================");
+}
+
+// ===== SETUP =====
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(LEFT_IR, INPUT);
+  pinMode(RIGHT_IR, INPUT);
+
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+
+  pinMode(STBY, OUTPUT);
+
+  digitalWrite(STBY, HIGH);
+
+  stopMotors();
+
+  Serial.println("8 SENSOR HYBRID PID READY");
+
+  delay(2000);
+}
+
+// ===== LOOP =====
+void loop() {
+
+  readSensors();
+
+  followLine();
+
+  // Print every 300 ms
+  if (millis() - lastPrint >= 300) {
+
+    lastPrint = millis();
+    printSensors();
+  }
+}
