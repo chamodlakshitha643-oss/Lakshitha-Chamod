@@ -1,0 +1,230 @@
+// ==========================================
+// TB6612FNG Motor Driver Pins
+// ==========================================
+#define PWMA 5   // Right Motor Speed (PWM)
+#define PWMB 6   // Left Motor Speed (PWM)
+
+#define AIN1 7   // Right Motor Direction 1
+#define AIN2 8   // Right Motor Direction 2
+
+#define STBY 9   // Standby Pin (Must be HIGH)
+
+#define BIN1 10  // Left Motor Direction 1
+#define BIN2 11  // Left Motor Direction 2
+
+#define led13 13 // Built-in LED on Arduino Uno
+
+// ==========================================
+// 6-Sensor Array Settings (A0 - A5)
+// ==========================================
+#define sensorNumber 6
+int raw_sensor[sensorNumber];
+int sensor[sensorNumber];
+
+// S1 - S6 Threshold Values
+int threshold[sensorNumber] = { 319, 152, 125, 204, 227, 293 };[cite: 2]
+
+bool invert_line = false; // false = Black line on White | true = White line on Black
+
+// ==========================================
+// Dotted Line, Turn & Stop Settings
+// ==========================================
+#define turn_delay 10          // 90° හැරවුම් වලදී ඉරෙන් පිටතට යන ප්‍රමාණය
+#define u_turn_delay 50        // U-Turn ගැනීමට පෙර ප්‍රමාදය
+#define stop_timer 30          // Stop කොටුව මත නතර වීමට ගතවන කාලය
+const unsigned long dot_gap_timeout = 220; // Dotted line පරතරය හරහා යාමට දෙන උපරිම කාලය (ms)
+
+// ==========================================
+// Speed & PID Variables
+// ==========================================
+int max_speed = 250;          // උපරිම වේගය (0 - 255)
+int left_motor_speed = 180;   // සාමාන්‍ය ධාවන වේගය (වම් මෝටරය)
+int right_motor_speed = 180;  // සාමාන්‍ය ධාවන වේගය (දකුණු මෝටරය)
+int turn_speed = 130;         // හැරවීමේ වේගය (80 - 150 අතර)
+int dot_speed = 140;          // Dotted line gap එක හරහා යන වේගය
+
+int kp = 65;   // Proportional Gain (50 - 90 අතර)
+int kd = 900;  // Derivative Gain
+
+int sensor_sum;
+float calculated_pos;
+int PID;
+int turn_value = 0;
+float error, previous_error;
+float center_point = 3.5;
+int line_position;
+unsigned long last_line_seen_time = 0;
+
+void setup() {
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  pinMode(led13, OUTPUT);
+
+  // TB6612FNG Driver එක සක්‍රීය කිරීම
+  digitalWrite(STBY, HIGH);
+
+  Serial.begin(9600);
+
+  // ආරම්භ වීමට පෙර තත්පර 2ක් LED එක Blink වේ
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(led13, HIGH);
+    delay(250);
+    digitalWrite(led13, LOW);
+    delay(250);
+  }
+
+  last_line_seen_time = millis();
+}
+
+void loop() {
+  Line_Follow();
+}
+
+// ==========================================
+// Auto-Detecting Sensor Reading Function
+// ==========================================
+void read_sensor() {
+  line_position = 0;
+  sensor_sum = 0;
+
+  int raw_state[sensorNumber];
+
+  for (byte i = 0; i < sensorNumber; i++) {
+    raw_sensor[i] = analogRead(i);
+    if (raw_sensor[i] > threshold[i]) raw_state[i] = 1;
+    else raw_state[i] = 0;
+  }
+
+  // කෙළවරේ සංවේදක දෙක (S1 සහ S6) බලා පසුබිම (background) තීරණය කිරීම
+  if (raw_state[0] == 1 && raw_state[5] == 1) {
+    invert_line = true;
+    digitalWrite(led13, HIGH);
+  } else if (raw_state[0] == 0 && raw_state[5] == 0) {
+    invert_line = false;
+    digitalWrite(led13, LOW);
+  }
+
+  for (byte i = 0; i < sensorNumber; i++) {
+    if (!invert_line) {
+      sensor[i] = raw_state[i];
+    } else {
+      sensor[i] = !raw_state[i];
+    }
+  }
+
+  sensor_sum = (sensor[0] + sensor[1] + sensor[2] + sensor[3] + sensor[4] + sensor[5]);
+  line_position = (sensor[0] * 1 + sensor[1] * 2 + sensor[2] * 3 + sensor[3] * 4 + sensor[4] * 5 + sensor[5] * 6);
+
+  if (sensor_sum > 0) {
+    calculated_pos = (float)line_position / sensor_sum;
+    last_line_seen_time = millis();
+  }
+}
+
+// ==========================================
+// TB6612FNG Motor Control Function
+// ==========================================
+void motor(int left, int right) {
+  // Right Motor (Channel A: PWMA, AIN1, AIN2)
+  if (right > 0) {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+  } else if (right < 0) {
+    right = -right;
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+  } else {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
+  }
+
+  // Left Motor (Channel B: PWMB, BIN1, BIN2)
+  if (left > 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+  } else if (left < 0) {
+    left = -left;
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+  } else {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+  }
+
+  if (left > max_speed) left = max_speed;
+  if (right > max_speed) right = max_speed;
+
+  analogWrite(PWMB, abs(left));
+  analogWrite(PWMA, abs(right));
+}
+
+// ==========================================
+// Main PID + Dotted Line Following Function
+// ==========================================
+void Line_Follow() {
+  while (1) {
+    read_sensor();
+
+    // ඉර හමුවන විට සාමාන්‍ය PID ක්‍රියාත්මක කිරීම
+    if (sensor_sum > 0) {
+      error = center_point - calculated_pos;
+      PID = error * kp + kd * (error - previous_error);
+      previous_error = error;
+
+      int right_motor = right_motor_speed - PID;
+      int left_motor = left_motor_speed + PID;
+
+      motor(left_motor, right_motor);
+
+      // Left Turn Detection
+      if (sensor[5] == 1 && sensor[0] == 0) turn_value = 1;
+
+      // Right Turn Detection
+      if (sensor[5] == 0 && sensor[0] == 1) turn_value = 2;
+    }
+
+    // සියලුම සංවේදක ඉරෙන් පිටත ඇති විට (Dotted Line Gap / Turn / U-Turn)
+    if (sensor_sum == 0) {
+      // 90° Turn flag එකක් තිබේ නම් හැරවුම සිදු කිරීම
+      if (turn_value == 1) {
+        delay(turn_delay);
+        motor(-turn_speed, turn_speed);
+        while (sensor[3] == 0 && sensor[2] == 0) read_sensor();
+        turn_value = 0;
+      } else if (turn_value == 2) {
+        delay(turn_delay);
+        motor(turn_speed, -turn_speed);
+        while (sensor[3] == 0 && sensor[2] == 0) read_sensor();
+        turn_value = 0;
+      } else {
+        // Turn flag එකක් නැති විට: Dotted line gap එකක්දැයි බැලීමට කෙටි කාලයක් ඉදිරියට යාම
+        if (millis() - last_line_seen_time < dot_gap_timeout) {
+          motor(dot_speed, dot_speed);
+        } else {
+          // වැඩි කාලයක් ඉර නොපෙනේ නම් U-Turn ගැනීම
+          delay(u_turn_delay);
+          motor(turn_speed, -turn_speed);
+          while (sensor[3] == 0 && sensor[2] == 0) read_sensor();
+          turn_value = 0;
+          last_line_seen_time = millis();
+        }
+      }
+    }
+    // සියලුම සංවේදක ඉර මත ඇති විට (End / Cross / T-Junction)
+    else if (sensor_sum == 6) {
+      delay(stop_timer);
+      read_sensor();
+      if (sensor_sum == 6) {
+        motor(0, 0); // STOP
+        while (sensor_sum == 6) read_sensor();
+      } else if (sensor_sum == 0) {
+        turn_value = 2;
+      }
+    }
+  }
+}
