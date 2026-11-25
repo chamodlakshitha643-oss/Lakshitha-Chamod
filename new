@@ -1,0 +1,721 @@
+
+/*
+  6 SENSOR DUAL COLOUR PID LINE FOLLOWER
+
+  Arduino UNO + TB6612FNG
+
+  S1 = LEFT
+  S6 = RIGHT
+
+  Channel A = RIGHT MOTOR
+  Channel B = LEFT MOTOR
+
+  Automatic Black / White Line Switching
+  Dotted Line Following
+  Sharp Turns
+  U-Turn with Timeout
+*/
+
+// ===== MOTOR DRIVER PINS =====
+
+#define PWMA 5
+#define PWMB 6
+
+#define AIN1 7
+#define AIN2 8
+
+#define BIN1 9
+#define BIN2 10
+
+#define STBY 4
+#define led13 13
+
+// ===== ANALOG SENSORS =====
+
+#define sensorNumber 6
+
+const byte sensorPins[sensorNumber] = {
+  A0, A1, A2, A3, A4, A5
+};
+
+int raw_sensor[sensorNumber];
+int raw_state[sensorNumber];
+int sensor[sensorNumber];
+
+int threshold[sensorNumber] = {
+  319, 152, 125, 204, 227, 293
+};
+
+const int hysteresis = 15;
+
+// ===== COLOUR MODE =====
+
+bool invert_line = false;
+
+int modeConfirmCount = 0;
+
+const int modeConfirmLimit = 4;
+
+bool transitionDetected = false;
+
+unsigned long lastModeSwitch = 0;
+
+// ===== SPEED SETTINGS =====
+
+int max_speed = 170;
+
+int left_motor_speed = 90;
+int right_motor_speed = 90;
+
+int turn_speed = 85;
+int dot_speed = 75;
+
+int min_speed = 45;
+
+// ===== PID SETTINGS =====
+
+float kp = 65.0;
+float kd = 90.0;
+
+float error = 0;
+float previous_error = 0;
+
+float filteredDerivative = 0;
+
+float center_point = 3.5;
+
+bool previousPID = false;
+
+// ===== SENSOR POSITION =====
+
+int sensor_sum = 0;
+int line_position = 0;
+
+float calculated_pos = 3.5;
+
+// ===== TURN SETTINGS =====
+
+int turn_value = 0;
+
+const unsigned long dot_gap_timeout = 220;
+
+const unsigned long turn_timeout = 600;
+
+const unsigned long u_turn_timeout = 1000;
+
+const unsigned long stop_timer = 30;
+
+unsigned long last_line_seen_time = 0;
+
+bool hasSeenLine = false;
+bool stopped = false;
+
+bool allLineDetected = false;
+unsigned long allLineStart = 0;
+
+// ===== CONTROL TIMING =====
+
+unsigned long lastControl = 0;
+unsigned long lastPrint = 0;
+
+const unsigned long controlInterval = 5;
+
+const char* direction = "STOP";
+
+// ==========================================
+// MOTOR CONTROL
+// ==========================================
+
+void motor(int left, int right) {
+
+  left = constrain(left, -max_speed, max_speed);
+  right = constrain(right, -max_speed, max_speed);
+
+  // RIGHT MOTOR - CHANNEL A
+
+  if (right > 0) {
+
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+
+  } else if (right < 0) {
+
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+
+  } else {
+
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
+  }
+
+  // LEFT MOTOR - CHANNEL B
+
+  if (left > 0) {
+
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+
+  } else if (left < 0) {
+
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+
+  } else {
+
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+  }
+
+  analogWrite(PWMA, abs(right));
+  analogWrite(PWMB, abs(left));
+}
+
+// ===== STOP MOTORS =====
+
+void stopMotors() {
+
+  motor(0, 0);
+}
+
+// ===== RESET PID =====
+
+void resetPID() {
+
+  previousPID = false;
+
+  previous_error = 0;
+  filteredDerivative = 0;
+}
+
+// ==========================================
+// READ ANALOG SENSORS
+// ==========================================
+
+void read_sensor() {
+
+  sensor_sum = 0;
+  line_position = 0;
+
+  for (byte i = 0; i < sensorNumber; i++) {
+
+    // ADC settling
+
+    analogRead(sensorPins[i]);
+
+    long sum = 0;
+
+    for (byte j = 0; j < 4; j++) {
+
+      sum += analogRead(sensorPins[i]);
+    }
+
+    raw_sensor[i] = sum / 4;
+
+    // Hysteresis detection
+
+    if (raw_sensor[i] >= threshold[i]) {
+
+      raw_state[i] = 1;
+
+    } else if (
+      raw_sensor[i] <= threshold[i] - hysteresis
+    ) {
+
+      raw_state[i] = 0;
+    }
+  }
+
+  // ===== AUTOMATIC COLOUR DETECTION =====
+
+  bool outerBlack =
+    raw_state[0] == 1 &&
+    raw_state[5] == 1;
+
+  bool outerWhite =
+    raw_state[0] == 0 &&
+    raw_state[5] == 0;
+
+  bool centreBlack =
+    raw_state[2] == 1 ||
+    raw_state[3] == 1;
+
+  bool centreWhite =
+    raw_state[2] == 0 ||
+    raw_state[3] == 0;
+
+  bool whitePattern =
+    outerBlack && centreWhite;
+
+  bool blackPattern =
+    outerWhite && centreBlack;
+
+  bool switchCandidate =
+    (!invert_line && whitePattern) ||
+    (invert_line && blackPattern);
+
+  transitionDetected = switchCandidate;
+
+  if (switchCandidate) {
+
+    if (modeConfirmCount < modeConfirmLimit) {
+      modeConfirmCount++;
+    }
+
+  } else {
+
+    modeConfirmCount = 0;
+  }
+
+  if (
+    modeConfirmCount >= modeConfirmLimit &&
+    millis() - lastModeSwitch >= 150
+  ) {
+
+    invert_line = !invert_line;
+
+    modeConfirmCount = 0;
+
+    transitionDetected = false;
+
+    lastModeSwitch = millis();
+
+    turn_value = 0;
+
+    resetPID();
+  }
+
+  // LED ON = WHITE LINE
+  // LED OFF = BLACK LINE
+
+  digitalWrite(
+    led13,
+    invert_line ? HIGH : LOW
+  );
+
+  // ===== CONVERT LINE COLOUR =====
+
+  for (byte i = 0; i < sensorNumber; i++) {
+
+    if (invert_line) {
+
+      sensor[i] = !raw_state[i];
+
+    } else {
+
+      sensor[i] = raw_state[i];
+    }
+
+    sensor_sum += sensor[i];
+
+    line_position += sensor[i] * (i + 1);
+  }
+
+  if (
+    sensor_sum > 0 &&
+    sensor_sum < 6 &&
+    !transitionDetected
+  ) {
+
+    calculated_pos =
+      (float)line_position / sensor_sum;
+
+    last_line_seen_time = millis();
+
+    hasSeenLine = true;
+  }
+}
+
+// ==========================================
+// TURN WITH TIMEOUT
+// ==========================================
+
+bool performTurn(
+  int turnDirection,
+  unsigned long timeout
+) {
+
+  unsigned long startTime = millis();
+
+  resetPID();
+
+  if (turnDirection == 1) {
+
+    direction = "SHARP LEFT";
+
+    motor(-turn_speed, turn_speed);
+
+  } else {
+
+    direction = "SHARP RIGHT";
+
+    motor(turn_speed, -turn_speed);
+  }
+
+  while (millis() - startTime < timeout) {
+
+    read_sensor();
+
+    if (
+      !transitionDetected &&
+      sensor_sum < 6 &&
+      (sensor[2] == 1 || sensor[3] == 1)
+    ) {
+
+      stopMotors();
+
+      turn_value = 0;
+
+      last_line_seen_time = millis();
+
+      resetPID();
+
+      return true;
+    }
+
+    delay(5);
+  }
+
+  // Line not found within timeout
+
+  stopMotors();
+
+  turn_value = 0;
+
+  stopped = true;
+
+  direction = "TURN TIMEOUT - STOP";
+
+  return false;
+}
+
+// ==========================================
+// MAIN PID LINE FOLLOWING
+// ==========================================
+
+void Line_Follow() {
+
+  read_sensor();
+
+  if (stopped) {
+
+    stopMotors();
+
+    return;
+  }
+
+  // ===== COLOUR TRANSITION =====
+
+  if (transitionDetected) {
+
+    direction = "COLOUR SWITCHING";
+
+    stopMotors();
+
+    resetPID();
+
+    return;
+  }
+
+  // ===== END / JUNCTION DETECTION =====
+
+  if (sensor_sum == 6) {
+
+    stopMotors();
+
+    resetPID();
+
+    if (!allLineDetected) {
+
+      allLineDetected = true;
+
+      allLineStart = millis();
+    }
+
+    if (millis() - allLineStart >= stop_timer) {
+
+      stopped = true;
+
+      direction = "END / JUNCTION - STOP";
+    }
+
+    return;
+  }
+
+  allLineDetected = false;
+
+  // ===== NORMAL PID =====
+
+  if (sensor_sum > 0) {
+
+    // Correct PID direction
+
+    error = calculated_pos - center_point;
+
+    if (!previousPID) {
+
+      previous_error = error;
+
+      filteredDerivative = 0;
+    }
+
+    previousPID = true;
+
+    float derivative =
+      error - previous_error;
+
+    filteredDerivative =
+      0.65 * filteredDerivative +
+      0.35 * derivative;
+
+    float PID =
+      kp * error +
+      kd * filteredDerivative;
+
+    previous_error = error;
+
+    // Reduce speed on curves
+
+    int speedReduction =
+      (int)(abs(error) * 12);
+
+    int leftBase = constrain(
+      left_motor_speed - speedReduction,
+      min_speed,
+      left_motor_speed
+    );
+
+    int rightBase = constrain(
+      right_motor_speed - speedReduction,
+      min_speed,
+      right_motor_speed
+    );
+
+    // Slow down after colour change
+
+    if (millis() - lastModeSwitch < 200) {
+
+      leftBase = min(leftBase, 60);
+
+      rightBase = min(rightBase, 60);
+    }
+
+    int left_motor =
+      constrain(
+        (int)(leftBase + PID),
+        -max_speed,
+        max_speed
+      );
+
+    int right_motor =
+      constrain(
+        (int)(rightBase - PID),
+        -max_speed,
+        max_speed
+      );
+
+    motor(left_motor, right_motor);
+
+    // ===== CORRECT TURN DETECTION =====
+
+    if (sensor[0] == 1 && sensor[5] == 0) {
+
+      turn_value = 1;
+
+    } else if (
+      sensor[5] == 1 && sensor[0] == 0
+    ) {
+
+      turn_value = 2;
+
+    } else if (abs(error) < 0.5) {
+
+      turn_value = 0;
+    }
+
+    // ===== DIRECTION =====
+
+    if (error < -0.5) {
+
+      direction = "LEFT";
+
+    } else if (error > 0.5) {
+
+      direction = "RIGHT";
+
+    } else {
+
+      direction = "FORWARD";
+    }
+
+    return;
+  }
+
+  // ===== LINE LOST =====
+
+  resetPID();
+
+  // Do not move if no line was found at startup
+
+  if (!hasSeenLine) {
+
+    stopMotors();
+
+    direction = "NO LINE - STOP";
+
+    return;
+  }
+
+  // ===== LEFT TURN =====
+
+  if (turn_value == 1) {
+
+    performTurn(1, turn_timeout);
+
+    return;
+  }
+
+  // ===== RIGHT TURN =====
+
+  if (turn_value == 2) {
+
+    performTurn(2, turn_timeout);
+
+    return;
+  }
+
+  // ===== DOTTED LINE =====
+
+  if (
+    millis() - last_line_seen_time <
+    dot_gap_timeout
+  ) {
+
+    direction = "DOTTED GAP";
+
+    motor(dot_speed, dot_speed);
+
+    return;
+  }
+
+  // ===== U-TURN =====
+
+  direction = "U-TURN";
+
+  performTurn(2, u_turn_timeout);
+}
+
+// ==========================================
+// SERIAL MONITOR
+// ==========================================
+
+void printSensors() {
+
+  Serial.print("MODE=");
+
+  Serial.print(
+    invert_line ? "WHITE" : "BLACK"
+  );
+
+  Serial.print(" | RAW=");
+
+  for (byte i = 0; i < sensorNumber; i++) {
+
+    Serial.print(raw_sensor[i]);
+
+    Serial.print(" ");
+  }
+
+  Serial.print("| COLOUR=");
+
+  for (byte i = 0; i < sensorNumber; i++) {
+
+    Serial.print(
+      raw_state[i] ? "B " : "W "
+    );
+  }
+
+  Serial.print("| LINE=");
+
+  for (byte i = 0; i < sensorNumber; i++) {
+
+    Serial.print(sensor[i]);
+
+    Serial.print(" ");
+  }
+
+  Serial.print("| ERROR=");
+
+  Serial.print(error);
+
+  Serial.print(" | DIR=");
+
+  Serial.println(direction);
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+
+  pinMode(STBY, OUTPUT);
+  pinMode(led13, OUTPUT);
+
+  digitalWrite(STBY, LOW);
+
+  stopMotors();
+
+  // Startup delay
+
+  for (int i = 0; i < 4; i++) {
+
+    digitalWrite(led13, HIGH);
+    delay(250);
+
+    digitalWrite(led13, LOW);
+    delay(250);
+  }
+
+  digitalWrite(STBY, HIGH);
+
+  last_line_seen_time = millis();
+
+  Serial.println(
+    "DUAL COLOUR PID READY"
+  );
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+
+void loop() {
+
+  if (
+    millis() - lastControl >= controlInterval
+  ) {
+
+    lastControl = millis();
+
+    Line_Follow();
+  }
+
+  if (millis() - lastPrint >= 300) {
+
+    lastPrint = millis();
+
+    printSensors();
+  }
+}
