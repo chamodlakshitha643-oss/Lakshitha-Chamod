@@ -1,0 +1,330 @@
+// =========================================
+// 6 SENSOR PID LINE FOLLOWER ROBOT
+// Arduino UNO + TCRT5000 + TB6612FNG
+// =========================================
+
+// Motor Driver Pins
+
+#define PWMA 5
+#define AIN1 7
+#define AIN2 8
+
+#define PWMB 6
+#define BIN1 9
+#define BIN2 10
+
+#define STBY 4
+
+// Motor Direction Settings
+
+bool reverseRight = true;
+bool reverseLeft = false;
+
+// Sensor Pins
+
+const int sensorPins[6] = {
+  A0, A1, A2, A3, A4, A5
+};
+
+// Sensor Calibration Values
+
+const int whiteValue[6] = {
+  32, 33, 32, 35, 38, 34
+};
+
+const int blackValue[6] = {
+  474, 234, 207, 421, 736, 361
+};
+
+const int threshold[6] = {
+  253, 134, 120, 228, 387, 198
+};
+
+const int weights[6] = {
+  -2500, -1500, -500,
+   500, 1500, 2500
+};
+
+int raw[6];
+int state[6];
+
+float filtered[6] = {0};
+float alpha = 0.85;
+
+// PID Constants
+
+float Kp = 0.035;
+float Ki = 0.000;
+float Kd = 0.020;
+
+float error = 0;
+float lastError = 0;
+float integral = 0;
+float derivative = 0;
+float correction = 0;
+
+// Speed Settings
+
+int baseSpeed = 65;
+int maxSpeed = 100;
+
+int leftSpeed = 0;
+int rightSpeed = 0;
+
+bool lineFound = false;
+bool previousFound = false;
+
+unsigned long lastDebug = 0;
+
+// =========================================
+// SETUP
+// =========================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+
+  pinMode(STBY, OUTPUT);
+
+  digitalWrite(STBY, LOW);
+
+  stopMotors();
+
+  delay(2000);
+
+  digitalWrite(STBY, HIGH);
+}
+
+// =========================================
+// SENSOR READING
+// =========================================
+
+void readSensors() {
+
+  float weightedSum = 0;
+  float total = 0;
+
+  lineFound = false;
+
+  for (int i = 0; i < 6; i++) {
+
+    raw[i] = analogRead(sensorPins[i]);
+
+    state[i] = raw[i] >= threshold[i];
+
+    float normalized =
+      1000.0 * (raw[i] - whiteValue[i]) /
+      (blackValue[i] - whiteValue[i]);
+
+    normalized = constrain(
+      normalized, 0.0, 1000.0
+    );
+
+    filtered[i] =
+      alpha * normalized +
+      (1.0 - alpha) * filtered[i];
+
+    if (state[i] == 1) {
+      lineFound = true;
+    }
+
+    if (filtered[i] > 150) {
+
+      weightedSum +=
+        filtered[i] * weights[i];
+
+      total += filtered[i];
+    }
+  }
+
+  if (lineFound && total > 0) {
+
+    error = weightedSum / total;
+
+  } else {
+
+    lineFound = false;
+  }
+}
+
+// =========================================
+// RIGHT MOTOR
+// =========================================
+
+void rightMotor(int speed) {
+
+  speed = constrain(speed, 0, maxSpeed);
+
+  digitalWrite(AIN1, !reverseRight);
+  digitalWrite(AIN2, reverseRight);
+
+  analogWrite(PWMA, speed);
+}
+
+// =========================================
+// LEFT MOTOR
+// =========================================
+
+void leftMotor(int speed) {
+
+  speed = constrain(speed, 0, maxSpeed);
+
+  digitalWrite(BIN1, !reverseLeft);
+  digitalWrite(BIN2, reverseLeft);
+
+  analogWrite(PWMB, speed);
+}
+
+// =========================================
+// STOP MOTORS
+// =========================================
+
+void stopMotors() {
+
+  analogWrite(PWMA, 0);
+  analogWrite(PWMB, 0);
+
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, LOW);
+
+  leftSpeed = 0;
+  rightSpeed = 0;
+}
+
+// =========================================
+// PID CONTROL
+// =========================================
+
+void PIDcontrol() {
+
+  if (!lineFound) {
+
+    stopMotors();
+
+    integral = 0;
+    derivative = 0;
+    correction = 0;
+
+    previousFound = false;
+
+    return;
+  }
+
+  if (!previousFound) {
+    lastError = error;
+  }
+
+  integral += error;
+
+  integral = constrain(
+    integral, -10000.0, 10000.0
+  );
+
+  derivative = error - lastError;
+
+  correction =
+    Kp * error +
+    Ki * integral +
+    Kd * derivative;
+
+  lastError = error;
+
+  leftSpeed = constrain(
+    baseSpeed - correction, 0, maxSpeed
+  );
+
+  rightSpeed = constrain(
+    baseSpeed + correction, 0, maxSpeed
+  );
+
+  leftMotor(leftSpeed);
+  rightMotor(rightSpeed);
+
+  previousFound = true;
+}
+
+// =========================================
+// SERIAL MONITOR DEBUGGING
+// =========================================
+
+void debugOutput() {
+
+  if (millis() - lastDebug < 200) {
+    return;
+  }
+
+  lastDebug = millis();
+
+  Serial.print("RAW: ");
+
+  for (int i = 0; i < 6; i++) {
+
+    Serial.print(raw[i]);
+    Serial.print(" ");
+  }
+
+  Serial.print(" | B/W: ");
+
+  for (int i = 0; i < 6; i++) {
+
+    Serial.print(state[i]);
+    Serial.print(" ");
+  }
+
+  Serial.print(" | Error: ");
+  Serial.print(error, 1);
+
+  Serial.print(" | PID: ");
+  Serial.print(correction, 1);
+
+  Serial.print(" | LEFT: ");
+  Serial.print(leftSpeed);
+
+  Serial.print(" | RIGHT: ");
+  Serial.print(rightSpeed);
+
+  Serial.print(" | STATE: ");
+
+  if (!lineFound) {
+    Serial.println("LINE LOST - STOP");
+  }
+
+  else if (error < -300) {
+    Serial.println("TURN LEFT");
+  }
+
+  else if (error > 300) {
+    Serial.println("TURN RIGHT");
+  }
+
+  else {
+    Serial.println("FORWARD");
+  }
+}
+
+// =========================================
+// MAIN LOOP
+// =========================================
+
+void loop() {
+
+  readSensors();
+
+  PIDcontrol();
+
+  debugOutput();
+
+  delay(10);
+}
