@@ -1,0 +1,1014 @@
+
+// =============================================
+// 6 SENSOR PID LINE FOLLOWER ROBOT - V14
+// Arduino UNO + TCRT5000 + TB6612FNG
+// Black / White Line Following
+// Automatic 90 Degree Turning
+// Dotted Line & Gap Recovery
+// =============================================
+
+// MOTOR DRIVER PINS
+
+#define PWMA 5
+#define AIN1 7
+#define AIN2 8
+
+#define PWMB 6
+#define BIN1 9
+#define BIN2 10
+
+#define STBY 4
+
+// MOTOR DIRECTIONS
+
+bool reverseRight = true;
+bool reverseLeft = false;
+
+bool testMode = false;
+
+// SENSOR PINS
+
+const int sensorPins[6] = {
+  A0, A1, A2, A3, A4, A5
+};
+
+// SENSOR CALIBRATION
+
+const int whiteValue[6] = {
+  32, 33, 32, 35, 38, 34
+};
+
+const int blackValue[6] = {
+  474, 234, 207, 421, 736, 361
+};
+
+const int weights[6] = {
+  -2500, -1500, -500,
+   500, 1500, 2500
+};
+
+int raw[6];
+int state[6];
+
+float normalized[6] = {0};
+float filtered[6] = {0};
+
+float alpha = 0.80;
+
+// =============================================
+// AUTOMATIC POLARITY SETTINGS
+// =============================================
+
+bool whiteLineMode = false;
+
+int polarityConfirm = 0;
+
+const int polarityConfirmLimit = 4;
+
+const int lineThreshold = 300;
+
+bool polarityPending = false;
+
+// =============================================
+// PID SETTINGS
+// =============================================
+
+float Kp = 0.030;
+float Ki = 0.000;
+float Kd = 0.015;
+
+float error = 0;
+float lastError = 0;
+float integral = 0;
+float derivative = 0;
+float correction = 0;
+
+int errorDeadZone = 150;
+
+// =============================================
+// MOTOR SPEED SETTINGS
+// =============================================
+
+int baseSpeed = 45;
+int maxSpeed = 75;
+int minSpeed = 40;
+
+int dynamicSpeed = 45;
+int turnLimit = 75;
+
+int leftSpeed = 0;
+int rightSpeed = 0;
+
+int targetLeft = 0;
+int targetRight = 0;
+
+int accelerationStep = 4;
+int decelerationStep = 8;
+
+// =============================================
+// DOTTED LINE SETTINGS
+// =============================================
+
+bool gapMode = false;
+
+bool validLineSeen = false;
+
+unsigned long gapStart = 0;
+
+const unsigned long gapTimeout = 350;
+
+int gapSpeed = 45;
+
+float gapError = 0;
+
+int stableLineCount = 0;
+
+// =============================================
+// 90 DEGREE TURN SETTINGS
+// =============================================
+
+int turnSpeed = 65;
+
+int turnMode = 0;
+int turnConfirm = 0;
+int turnCandidate = 0;
+int centerConfirm = 0;
+
+unsigned long turnStart = 0;
+
+const unsigned long minimumTurnTime = 60;
+const unsigned long turnTimeout = 450;
+
+bool safetyStop = false;
+bool lineFound = false;
+bool previousFound = false;
+
+unsigned long lastDebug = 0;
+
+// =============================================
+// SETUP
+// =============================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+
+  pinMode(STBY, OUTPUT);
+
+  digitalWrite(STBY, LOW);
+
+  stopMotors();
+
+  delay(2000);
+
+  if (!testMode) {
+
+    digitalWrite(STBY, HIGH);
+  }
+}
+
+// =============================================
+// RESET PID
+// =============================================
+
+void resetPID() {
+
+  integral = 0;
+  derivative = 0;
+  correction = 0;
+
+  lastError = error;
+
+  previousFound = false;
+}
+
+// =============================================
+// RAW SENSOR READING
+// =============================================
+
+void readRawSensors() {
+
+  for (int i = 0; i < 6; i++) {
+
+    raw[i] = analogRead(sensorPins[i]);
+
+    normalized[i] =
+      1000.0 * (raw[i] - whiteValue[i]) /
+      (blackValue[i] - whiteValue[i]);
+
+    normalized[i] = constrain(
+      normalized[i], 0.0, 1000.0
+    );
+  }
+}
+
+// =============================================
+// AUTOMATIC POLARITY DETECTION
+// =============================================
+
+void detectPolarity() {
+
+  polarityPending = false;
+
+  if (turnMode != 0) {
+
+    polarityConfirm = 0;
+
+    return;
+  }
+
+  bool blackBackground =
+    normalized[0] > 650 &&
+    normalized[1] > 650 &&
+    normalized[4] > 650 &&
+    normalized[5] > 650;
+
+  bool whiteBackground =
+    normalized[0] < 250 &&
+    normalized[1] < 250 &&
+    normalized[4] < 250 &&
+    normalized[5] < 250;
+
+  bool whiteCenter =
+    normalized[2] < 250 ||
+    normalized[3] < 250;
+
+  bool blackCenter =
+    normalized[2] > 350 ||
+    normalized[3] > 350;
+
+  bool possibleWhiteLine =
+    blackBackground && whiteCenter;
+
+  bool possibleBlackLine =
+    whiteBackground && blackCenter;
+
+  bool switchNeeded =
+    (!whiteLineMode && possibleWhiteLine) ||
+    (whiteLineMode && possibleBlackLine);
+
+  if (switchNeeded) {
+
+    polarityPending = true;
+
+    polarityConfirm++;
+
+  } else {
+
+    polarityConfirm = 0;
+  }
+
+  if (polarityConfirm >= polarityConfirmLimit) {
+
+    whiteLineMode = !whiteLineMode;
+
+    polarityConfirm = 0;
+    polarityPending = false;
+
+    gapMode = false;
+    validLineSeen = false;
+    stableLineCount = 0;
+
+    turnConfirm = 0;
+    turnCandidate = 0;
+
+    for (int i = 0; i < 6; i++) {
+
+      filtered[i] = whiteLineMode
+        ? 1000.0 - normalized[i]
+        : normalized[i];
+    }
+
+    resetPID();
+
+    if (whiteLineMode) {
+
+      Serial.println("SWITCHED TO WHITE LINE");
+
+    } else {
+
+      Serial.println("SWITCHED TO BLACK LINE");
+    }
+  }
+}
+
+// =============================================
+// SENSOR PROCESSING
+// =============================================
+
+void processSensors() {
+
+  float weightedSum = 0;
+  float total = 0;
+
+  int activeSensors = 0;
+
+  lineFound = false;
+
+  for (int i = 0; i < 6; i++) {
+
+    float lineStrength;
+
+    if (whiteLineMode) {
+
+      lineStrength = 1000.0 - normalized[i];
+
+    } else {
+
+      lineStrength = normalized[i];
+    }
+
+    filtered[i] =
+      alpha * lineStrength +
+      (1.0 - alpha) * filtered[i];
+
+    state[i] = lineStrength >= lineThreshold;
+
+    if (state[i]) {
+
+      activeSensors++;
+    }
+
+    if (filtered[i] > 150) {
+
+      weightedSum += filtered[i] * weights[i];
+
+      total += filtered[i];
+    }
+  }
+
+  if (activeSensors > 0 &&
+      activeSensors < 6 &&
+      total > 0) {
+
+    lineFound = true;
+
+    error = weightedSum / total;
+  }
+}
+
+// =============================================
+// RIGHT MOTOR
+// =============================================
+
+void rightMotor(int speed) {
+
+  speed = constrain(speed, 0, maxSpeed);
+
+  digitalWrite(AIN1, !reverseRight);
+  digitalWrite(AIN2, reverseRight);
+
+  analogWrite(PWMA, speed);
+}
+
+// =============================================
+// LEFT MOTOR
+// =============================================
+
+void leftMotor(int speed) {
+
+  speed = constrain(speed, 0, maxSpeed);
+
+  digitalWrite(BIN1, !reverseLeft);
+  digitalWrite(BIN2, reverseLeft);
+
+  analogWrite(PWMB, speed);
+}
+
+// =============================================
+// STOP MOTORS
+// =============================================
+
+void stopMotors() {
+
+  analogWrite(PWMA, 0);
+  analogWrite(PWMB, 0);
+
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, LOW);
+
+  leftSpeed = 0;
+  rightSpeed = 0;
+
+  targetLeft = 0;
+  targetRight = 0;
+
+  dynamicSpeed = 0;
+}
+
+// =============================================
+// MOTOR SPEED SMOOTHING
+// =============================================
+
+int smoothSpeed(int current, int target) {
+
+  if (current < target) {
+
+    current += accelerationStep;
+
+    if (current > target) {
+
+      current = target;
+    }
+
+  } else if (current > target) {
+
+    current -= decelerationStep;
+
+    if (current < target) {
+
+      current = target;
+    }
+  }
+
+  return current;
+}
+
+// =============================================
+// CENTER LINE DETECTION
+// =============================================
+
+bool centerLineFound() {
+
+  return
+    !state[0] &&
+    !state[1] &&
+    (state[2] || state[3]) &&
+    !state[4] &&
+    !state[5];
+}
+
+// =============================================
+// EMPTY BACKGROUND DETECTION
+// =============================================
+
+bool emptyBackground() {
+
+  for (int i = 0; i < 6; i++) {
+
+    if (state[i]) {
+
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// =============================================
+// DOTTED LINE GAP RECOVERY
+// =============================================
+
+void handleGap() {
+
+  if (!gapMode) {
+
+    // Only allow recovery after a stable
+    // centered line has been detected
+
+    if (!validLineSeen ||
+        stableLineCount < 3 ||
+        abs(error) > 500 ||
+        !emptyBackground()) {
+
+      stopMotors();
+
+      resetPID();
+
+      return;
+    }
+
+    gapMode = true;
+
+    gapStart = millis();
+
+    gapError = error;
+
+    resetPID();
+  }
+
+  // Limited gap recovery time
+
+  if (millis() - gapStart >= gapTimeout) {
+
+    stopMotors();
+
+    gapMode = false;
+
+    safetyStop = true;
+
+    validLineSeen = false;
+
+    stableLineCount = 0;
+
+    Serial.println("GAP TIMEOUT - SAFETY STOP");
+
+    return;
+  }
+
+  // Stop if background pattern becomes ambiguous
+
+  if (!emptyBackground()) {
+
+    stopMotors();
+
+    gapMode = false;
+
+    validLineSeen = false;
+
+    stableLineCount = 0;
+
+    return;
+  }
+
+  // Small correction based on last line position
+
+  float gapCorrection =
+    constrain(gapError * 0.01, -5.0, 5.0);
+
+  targetLeft = constrain(
+    gapSpeed - gapCorrection, 0, 50
+  );
+
+  targetRight = constrain(
+    gapSpeed + gapCorrection, 0, 50
+  );
+
+  dynamicSpeed = gapSpeed;
+
+  leftSpeed = smoothSpeed(
+    leftSpeed, targetLeft
+  );
+
+  rightSpeed = smoothSpeed(
+    rightSpeed, targetRight
+  );
+
+  leftSpeed = constrain(leftSpeed, 0, 50);
+  rightSpeed = constrain(rightSpeed, 0, 50);
+
+  leftMotor(leftSpeed);
+  rightMotor(rightSpeed);
+}
+
+// =============================================
+// EARLY CURVE DETECTION
+// =============================================
+
+bool earlyCurveDetected() {
+
+  bool s1Side =
+    (state[0] || state[1]) &&
+    !state[4] && !state[5];
+
+  bool s6Side =
+    (state[4] || state[5]) &&
+    !state[0] && !state[1];
+
+  return s1Side || s6Side;
+}
+
+// =============================================
+// 90 DEGREE TURN DETECTION
+// =============================================
+
+int detectTurn() {
+
+  bool s1Turn =
+    state[0] && state[1] &&
+    (state[2] || state[3]) &&
+    !state[4] && !state[5];
+
+  bool s6Turn =
+    state[4] && state[5] &&
+    (state[2] || state[3]) &&
+    !state[0] && !state[1];
+
+  if (s1Turn) {
+
+    return -1;
+  }
+
+  if (s6Turn) {
+
+    return 1;
+  }
+
+  return 0;
+}
+
+// =============================================
+// START AUTOMATIC TURN
+// =============================================
+
+void startTurn(int direction) {
+
+  turnMode = direction;
+
+  turnStart = millis();
+
+  centerConfirm = 0;
+  turnConfirm = 0;
+  turnCandidate = 0;
+
+  gapMode = false;
+
+  validLineSeen = false;
+
+  stableLineCount = 0;
+
+  resetPID();
+}
+
+// =============================================
+// EXECUTE AUTOMATIC TURN
+// =============================================
+
+void executeTurn() {
+
+  unsigned long elapsed = millis() - turnStart;
+
+  if (elapsed >= turnTimeout) {
+
+    stopMotors();
+
+    safetyStop = true;
+
+    turnMode = 0;
+
+    resetPID();
+
+    Serial.println("TURN TIMEOUT - SAFETY STOP");
+
+    return;
+  }
+
+  if (elapsed >= minimumTurnTime &&
+      centerLineFound()) {
+
+    centerConfirm++;
+
+  } else {
+
+    centerConfirm = 0;
+  }
+
+  if (centerConfirm >= 3) {
+
+    turnMode = 0;
+
+    centerConfirm = 0;
+
+    resetPID();
+
+    PIDcontrol();
+
+    return;
+  }
+
+  if (turnMode == -1) {
+
+    targetLeft = turnSpeed;
+
+    targetRight = 0;
+
+  } else if (turnMode == 1) {
+
+    targetLeft = 0;
+
+    targetRight = turnSpeed;
+  }
+
+  dynamicSpeed = turnSpeed;
+
+  leftSpeed = smoothSpeed(
+    leftSpeed, targetLeft
+  );
+
+  rightSpeed = smoothSpeed(
+    rightSpeed, targetRight
+  );
+
+  leftMotor(leftSpeed);
+  rightMotor(rightSpeed);
+}
+
+// =============================================
+// NORMAL PID CONTROL
+// =============================================
+
+void PIDcontrol() {
+
+  if (!lineFound) {
+
+    handleGap();
+
+    return;
+  }
+
+  if (gapMode) {
+
+    gapMode = false;
+
+    stableLineCount = 0;
+
+    resetPID();
+
+    Serial.println("LINE RECOVERED");
+  }
+
+  if (centerLineFound()) {
+
+    if (stableLineCount < 10) {
+
+      stableLineCount++;
+    }
+
+    if (stableLineCount >= 3) {
+
+      validLineSeen = true;
+    }
+
+  } else {
+
+    stableLineCount = 0;
+
+    validLineSeen = false;
+  }
+
+  float controlError = error;
+
+  if (abs(controlError) < errorDeadZone) {
+
+    controlError = 0;
+
+  } else if (controlError > 0) {
+
+    controlError -= errorDeadZone;
+
+  } else {
+
+    controlError += errorDeadZone;
+  }
+
+  if (!previousFound) {
+
+    lastError = controlError;
+  }
+
+  integral += controlError;
+
+  integral = constrain(
+    integral, -10000.0, 10000.0
+  );
+
+  derivative =
+    0.60 * derivative +
+    0.40 * (controlError - lastError);
+
+  correction =
+    Kp * controlError +
+    Ki * integral +
+    Kd * derivative;
+
+  lastError = controlError;
+
+  // CURVE SPEED CONTROL
+
+  float absError = abs(error);
+
+  if (earlyCurveDetected()) {
+
+    dynamicSpeed = 40;
+    turnLimit = 65;
+
+  } else if (absError < 500) {
+
+    dynamicSpeed = baseSpeed;
+    turnLimit = 50;
+
+  } else if (absError < 1000) {
+
+    dynamicSpeed = 42;
+    turnLimit = 60;
+
+  } else if (absError < 1800) {
+
+    dynamicSpeed = 40;
+    turnLimit = 70;
+
+  } else {
+
+    dynamicSpeed = minSpeed;
+    turnLimit = 75;
+  }
+
+  // MOTOR TARGET SPEEDS
+
+  targetLeft = constrain(
+    dynamicSpeed - correction,
+    0, turnLimit
+  );
+
+  targetRight = constrain(
+    dynamicSpeed + correction,
+    0, turnLimit
+  );
+
+  leftSpeed = smoothSpeed(
+    leftSpeed, targetLeft
+  );
+
+  rightSpeed = smoothSpeed(
+    rightSpeed, targetRight
+  );
+
+  leftSpeed = constrain(
+    leftSpeed, 0, turnLimit
+  );
+
+  rightSpeed = constrain(
+    rightSpeed, 0, turnLimit
+  );
+
+  leftMotor(leftSpeed);
+  rightMotor(rightSpeed);
+
+  previousFound = true;
+}
+
+// =============================================
+// SERIAL MONITOR
+// =============================================
+
+void debugOutput() {
+
+  if (millis() - lastDebug < 100) {
+
+    return;
+  }
+
+  lastDebug = millis();
+
+  Serial.print("RAW: ");
+
+  for (int i = 0; i < 6; i++) {
+
+    Serial.print(raw[i]);
+    Serial.print(" ");
+  }
+
+  Serial.print("| LINE: ");
+
+  for (int i = 0; i < 6; i++) {
+
+    Serial.print(state[i]);
+    Serial.print(" ");
+  }
+
+  Serial.print("| POLARITY: ");
+
+  Serial.print(
+    whiteLineMode ? "WHITE" : "BLACK"
+  );
+
+  Serial.print(" | ERROR: ");
+
+  Serial.print(error, 1);
+
+  Serial.print(" | LEFT: ");
+
+  Serial.print(leftSpeed);
+
+  Serial.print(" | RIGHT: ");
+
+  Serial.print(rightSpeed);
+
+  Serial.print(" | MODE: ");
+
+  if (safetyStop) {
+
+    Serial.println("SAFETY STOP");
+
+  } else if (testMode) {
+
+    Serial.println("SENSOR TEST");
+
+  } else if (polarityPending) {
+
+    Serial.println("CHECKING POLARITY");
+
+  } else if (turnMode == -1) {
+
+    Serial.println("90 TURN - S1");
+
+  } else if (turnMode == 1) {
+
+    Serial.println("90 TURN - S6");
+
+  } else if (gapMode) {
+
+    Serial.println("DOTTED LINE GAP");
+
+  } else if (!lineFound) {
+
+    Serial.println("LINE LOST - STOP");
+
+  } else if (earlyCurveDetected()) {
+
+    Serial.println("CURVE");
+
+  } else {
+
+    Serial.println("NORMAL PID");
+  }
+}
+
+// =============================================
+// MAIN LOOP
+// =============================================
+
+void loop() {
+
+  readRawSensors();
+
+  detectPolarity();
+
+  processSensors();
+
+  if (testMode || safetyStop) {
+
+    stopMotors();
+
+  } else if (polarityPending) {
+
+    stopMotors();
+
+    resetPID();
+
+    gapMode = false;
+
+    validLineSeen = false;
+
+    stableLineCount = 0;
+
+    turnConfirm = 0;
+    turnCandidate = 0;
+
+  } else if (turnMode != 0) {
+
+    executeTurn();
+
+  } else if (gapMode) {
+
+    PIDcontrol();
+
+  } else {
+
+    int detectedTurn = detectTurn();
+
+    if (detectedTurn == 0) {
+
+      turnConfirm = 0;
+
+      turnCandidate = 0;
+
+    } else if (detectedTurn == turnCandidate) {
+
+      turnConfirm++;
+
+    } else {
+
+      turnCandidate = detectedTurn;
+
+      turnConfirm = 1;
+    }
+
+    if (turnConfirm >= 2) {
+
+      startTurn(turnCandidate);
+
+      executeTurn();
+
+    } else {
+
+      PIDcontrol();
+    }
+  }
+
+  debugOutput();
+
+  delay(10);
+}
